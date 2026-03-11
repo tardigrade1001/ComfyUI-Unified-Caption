@@ -2,6 +2,8 @@
 
 Unified multimodal captioning node for ComfyUI with OpenRouter and Replicate support.
 
+---
+
 ## Example Workflow
 
 <p align="center">
@@ -11,6 +13,9 @@ Unified multimodal captioning node for ComfyUI with OpenRouter and Replicate sup
 <p align="center">
   Example ComfyUI workflow showing image caption generation using the Unified Caption node.
 </p>
+
+---
+
 A custom **ComfyUI node** for **single-image captioning using frontier multimodal AI models** through **OpenRouter** and **Replicate** APIs.
 
 This node provides a **unified interface** for multiple vision-language models, allowing users to caption images without dealing with provider-specific API differences. It also includes **runtime cost estimation, automatic model fallback, retry control, and flexible prompt configuration**.
