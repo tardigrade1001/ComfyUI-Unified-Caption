@@ -34,6 +34,10 @@ OPENROUTER_MODELS = [
 AVAILABLE_MODELS = REPLICATE_MODELS + OPENROUTER_MODELS
 DEFAULT_MODEL = AVAILABLE_MODELS[0]
 
+# Max retry attempts per model before falling through to the retry model.
+# Covers transient connection drops that truncate output mid-sentence.
+MAX_ATTEMPTS_PER_MODEL = 3
+
 # ==================================================
 # Core Logic & Error Handling
 # ==================================================
@@ -53,7 +57,8 @@ def extract_prices(label: str):
         in_p = float(parts[1].split("/")[0].replace("$", "").strip())
         out_p = float(parts[2].split("/")[0].replace("$", "").strip())
         return in_p, out_p
-    except: return 0.0, 0.0
+    except Exception:
+        return 0.0, 0.0
 
 def pil_to_data_url(img: Image.Image, max_size=1024) -> str:
     if img.mode in ("RGBA", "P"):
@@ -115,6 +120,28 @@ class UnifiedCaptionNode:
         )
         self.logger.info(f"[COST] ${cost_usd:.6f} | model={model}")
 
+    def _validate_completion(self, text: str, model: str) -> str:
+        """
+        Raise UnifiedAPIError if the output looks truncated.
+        A complete caption ends in terminal punctuation; a connection-dropped
+        or otherwise cut-off caption ends mid-word. The caller will catch the
+        exception and trigger a retry with the same model.
+        """
+        if not text:
+            raise UnifiedAPIError(f"{model} returned empty response")
+        # Strip trailing whitespace and markdown emphasis characters that
+        # might hide the actual terminal punctuation.
+        stripped = text.rstrip().rstrip('*_`')
+        if not stripped:
+            raise UnifiedAPIError(f"{model} returned empty response after stripping")
+        # Accepted terminators: sentence punctuation, straight/curly quotes,
+        # and closing brackets/parens for parenthetical endings.
+        if stripped[-1] not in '.!?"\'\u201d\u2019)]':
+            raise UnifiedAPIError(
+                f"{model} output appears truncated (ends: ...{stripped[-40:]!r})"
+            )
+        return text
+
     def _call_openrouter(self, key, model, prompt, sys_msg, img_url, temp, max_tokens, label):
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         user_content = [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": img_url}}]
@@ -125,7 +152,7 @@ class UnifiedCaptionNode:
 
         payload = {"model": model, "messages": messages, "temperature": temp, "max_tokens": max_tokens}
         
-        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
         if r.status_code != 200: raise UnifiedAPIError(f"OpenRouter Error: {r.text}")
         
         data = r.json()
@@ -145,9 +172,7 @@ class UnifiedCaptionNode:
             )
         
         content = data["choices"][0]["message"]["content"].strip()
-        if content and content[-1] not in ".!?\"'":
-            self.logger.warning(f"⚠️ {model} might have cut off or triggered a safety filter.")
-        return content
+        return self._validate_completion(content, model)
 
     def _call_replicate(self, key, model, prompt, sys_msg, img_url, temp, max_tokens, label):
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -158,7 +183,7 @@ class UnifiedCaptionNode:
         else:
             input_data = {"prompt": prompt, "image_input": [img_url], "temperature": temp, "max_tokens": max_tokens}
 
-        r = requests.post(REPLICATE_BASE_URL.format(model), headers=headers, json={"input": input_data}, timeout=60)
+        r = requests.post(REPLICATE_BASE_URL.format(model), headers=headers, json={"input": input_data}, timeout=30)
         if r.status_code not in (200, 201): raise UnifiedAPIError(f"Replicate Init Error: {r.text}")
         
         get_url = r.json()["urls"]["get"]
@@ -172,7 +197,7 @@ class UnifiedCaptionNode:
                 output = poll.get("output")
                 text = "".join(output) if isinstance(output, list) else str(output)
                 
-                # --- Original Replicate Token Extraction Logic Restored ---
+                # --- Replicate Token Extraction ---
                 metrics = poll.get("metrics", {})
                 input_tokens = metrics.get("input_token_count", metrics.get("tokens_in", 0))
                 output_tokens = metrics.get("output_token_count", metrics.get("tokens_out", 0))
@@ -200,9 +225,9 @@ class UnifiedCaptionNode:
                     out_price,
                     model,
                 )
-                # ----------------------------------------------------------
+                # ----------------------------------
 
-                return text.strip()
+                return self._validate_completion(text.strip(), model)
             
             if status == "failed":
                 raise UnifiedAPIError(f"Replicate Model Failed: {poll.get('error')}")
@@ -225,28 +250,62 @@ class UnifiedCaptionNode:
 
         retry = kwargs.get("retry_model")
         sequence = [model]
-        if retry and retry != model: sequence.append(retry)
+        if retry and retry != model:
+            sequence.append(retry)
 
         for label in sequence:
             provider, actual_model = normalize_label(label)
-            self.logger.info(f"Unified Node: Attempting {provider}/{actual_model}")
-            
-            try:
-                if provider == "openrouter":
-                    key = kwargs.get("openrouter_api_key") or os.environ.get("OPENROUTER_API_KEY")
-                    if not key: raise UnifiedAPIError("OpenRouter Key Missing")
-                    self.text_output = self._call_openrouter(key, actual_model, prompt, kwargs.get("system_instruction"), img_url, kwargs.get("temperature"), kwargs.get("max_tokens", 1024), label)
-                else:
-                    key = kwargs.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN")
-                    if not key: raise UnifiedAPIError("Replicate Key Missing")
-                    self.text_output = self._call_replicate(key, actual_model, prompt, kwargs.get("system_instruction"), img_url, kwargs.get("temperature"), kwargs.get("max_tokens", 1024), label)
-                
-                if self.text_output: 
-                    self.logger.info(f"Unified Node: Success with {actual_model}")
-                    return [] 
-            except Exception as e:
-                self.logger.warning(f"Unified Node: {actual_model} failed -> {e}")
-                continue
+
+            for attempt in range(1, MAX_ATTEMPTS_PER_MODEL + 1):
+                self.logger.info(
+                    f"Unified Node: Attempting {provider}/{actual_model} "
+                    f"(attempt {attempt}/{MAX_ATTEMPTS_PER_MODEL})"
+                )
+                try:
+                    if provider == "openrouter":
+                        key = kwargs.get("openrouter_api_key") or os.environ.get("OPENROUTER_API_KEY")
+                        if not key:
+                            raise UnifiedAPIError("OpenRouter Key Missing")
+                        self.text_output = self._call_openrouter(
+                            key, actual_model, prompt,
+                            kwargs.get("system_instruction"), img_url,
+                            kwargs.get("temperature"), kwargs.get("max_tokens", 1024), label
+                        )
+                    else:
+                        key = kwargs.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN")
+                        if not key:
+                            raise UnifiedAPIError("Replicate Key Missing")
+                        self.text_output = self._call_replicate(
+                            key, actual_model, prompt,
+                            kwargs.get("system_instruction"), img_url,
+                            kwargs.get("temperature"), kwargs.get("max_tokens", 1024), label
+                        )
+
+                    if self.text_output:
+                        self.logger.info(
+                            f"Unified Node: Success with {actual_model} on attempt {attempt}"
+                        )
+                        return []
+
+                except UnifiedAPIError as e:
+                    # Non-transient failures: don't waste attempts.
+                    if "Key Missing" in str(e):
+                        self.logger.warning(f"Unified Node: {actual_model} -> {e}")
+                        break  # skip remaining attempts for this model
+                    self.logger.warning(
+                        f"Unified Node: {actual_model} attempt {attempt} failed -> {e}"
+                    )
+                    if attempt < MAX_ATTEMPTS_PER_MODEL:
+                        time.sleep(1.5 * attempt)  # backoff: 1.5s, 3s
+                    continue
+
+                except Exception as e:
+                    self.logger.warning(
+                        f"Unified Node: {actual_model} attempt {attempt} failed -> {e}"
+                    )
+                    if attempt < MAX_ATTEMPTS_PER_MODEL:
+                        time.sleep(1.5 * attempt)
+                    continue
 
         if kwargs.get("error_fallback_value") is not None:
             self.logger.error("All models failed. Returning fallback value.")

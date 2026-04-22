@@ -18,7 +18,7 @@ Unified multimodal captioning node for ComfyUI with OpenRouter and Replicate sup
 
 A custom **ComfyUI node** for **single-image captioning using frontier multimodal AI models** through **OpenRouter** and **Replicate** APIs.
 
-This node provides a **unified interface** for multiple vision-language models, allowing users to caption images without dealing with provider-specific API differences. It also includes **runtime cost estimation, automatic model fallback, retry control, and flexible prompt configuration**.
+This node provides a **unified interface** for multiple vision-language models, allowing users to caption images without dealing with provider-specific API differences. It also includes **runtime cost estimation, automatic truncation detection, same-model retries with backoff, fallback to a secondary model, and flexible prompt configuration**.
 
 The node is designed primarily for **interactive captioning workflows**, where a user analyzes or describes an image and optionally regenerates alternate captions.
 
@@ -28,7 +28,9 @@ The node is designed primarily for **interactive captioning workflows**, where a
 
 - Unified interface for **OpenRouter and Replicate multimodal models**
 - Supports models such as **Gemini, Grok, and GPT vision models**
-- Automatic **fallback model retry**
+- **Automatic truncation detection** — output is validated for sentence completeness before being accepted
+- **Same-model retry with exponential backoff** — transient connection drops recover automatically
+- **Cross-provider fallback** — optional retry model kicks in if the primary fails repeatedly
 - **Cost estimation per request** using token usage
 - **Seed parameter to force reruns** in ComfyUI
 - Automatic **image resizing to reduce API cost**
@@ -73,10 +75,10 @@ replicate/google/gemini-3-flash | $0.50/M in | $3.00/M out
 
 # Node Overview
 
-**Node Name:**  
+**Node Name:**
 Unified Caption
 
-**Category:**  
+**Category:**
 Unified Caption
 
 **Input:**
@@ -205,17 +207,26 @@ OPENROUTER_API_KEY
 
 ## Retry Model
 
-Optional fallback model.
+Optional fallback model used when the primary model fails repeatedly.
 
-If the primary model fails, the node automatically retries using this model.
+The node first retries the **primary model up to 3 times** with short backoff between attempts. If all three attempts fail (for example, due to repeated truncation, connection issues, or provider errors), the node then falls through to the retry model and attempts it up to 3 times as well.
 
-This improves robustness when APIs temporarily fail.
+For best results, set the retry model to a **different provider** than the primary — for example, pair a Replicate primary with an OpenRouter fallback, or vice versa. This insulates the retry path from provider-specific issues that may have caused the primary to fail.
+
+Example pairing:
+
+
+Primary: replicate/google/gemini-3-flash
+Retry:   openrouter/x-ai/grok-4.1-fast
+
+
+If the retry model is left the same as the primary, only the primary is attempted (3 attempts total, then fallback value).
 
 ---
 
 ## Error Fallback Value
 
-Optional text returned if all model calls fail.
+Optional text returned if all model attempts fail.
 
 If not provided, the node will raise an error.
 
@@ -274,6 +285,62 @@ This output can be connected to:
 
 ---
 
+# Reliability: Truncation Detection & Retries
+
+Frontier multimodal APIs occasionally return truncated responses due to transient connection drops, upstream infrastructure issues, or intermittent content-policy flags. Rather than silently returning partial captions, the node validates every response for completeness before accepting it.
+
+### How truncation detection works
+
+After each API call, the node checks whether the returned text ends in terminal punctuation (`.`, `!`, `?`, closing quotes, or closing brackets). A complete caption ends in a sentence terminator; a truncated caption typically ends mid-word or mid-phrase. If the output looks truncated, the node treats the attempt as failed and retries.
+
+### Retry flow
+
+1. **Primary model — attempt 1.** If the output validates, return it.
+2. **Primary model — attempt 2** (after 1.5s backoff). Fresh request, new connection.
+3. **Primary model — attempt 3** (after 3s backoff).
+4. **Retry model — attempts 1 through 3** (if a retry model is configured and different from the primary).
+5. If all attempts fail, return the fallback value or raise an error.
+
+### What you'll see in the console
+
+Successful first attempt:
+
+
+Unified Node: Attempting replicate/google/gemini-3-flash (attempt 1/3)
+[COST] $0.001277 | model=google/gemini-3-flash
+Unified Node: Success with google/gemini-3-flash on attempt 1
+
+
+Transient truncation recovered on retry:
+
+
+Unified Node: Attempting replicate/google/gemini-3-flash (attempt 1/3)
+Unified Node: google/gemini-3-flash attempt 1 failed -> output appears truncated (ends: ...'The low-angle wide')
+Unified Node: Attempting replicate/google/gemini-3-flash (attempt 2/3)
+Unified Node: Success with google/gemini-3-flash on attempt 2
+
+
+Escalation to retry model after primary exhaustion:
+
+
+Unified Node: Attempting replicate/google/gemini-3-flash (attempt 1/3)
+Unified Node: google/gemini-3-flash attempt 1 failed -> ...
+Unified Node: Attempting replicate/google/gemini-3-flash (attempt 2/3)
+Unified Node: google/gemini-3-flash attempt 2 failed -> ...
+Unified Node: Attempting replicate/google/gemini-3-flash (attempt 3/3)
+Unified Node: google/gemini-3-flash attempt 3 failed -> ...
+Unified Node: Attempting openrouter/x-ai/grok-4.1-fast (attempt 1/3)
+Unified Node: Success with x-ai/grok-4.1-fast on attempt 1
+
+
+### Typical timing
+
+- Clean first-attempt success: ~5 seconds
+- One truncation recovered on retry: ~12 seconds
+- Worst case (all primary attempts fail, retry model succeeds): ~25 seconds
+
+---
+
 # Cost Estimation
 
 After each request, the node logs estimated API cost in the console.
@@ -281,9 +348,9 @@ After each request, the node logs estimated API cost in the console.
 Example output:
 
 
-Unified Node: Attempting replicate/google/gemini-3-flash
+Unified Node: Attempting replicate/google/gemini-3-flash (attempt 1/3)
 [COST] $0.001277 | model=google/gemini-3-flash
-Unified Node: Success with google/gemini-3-flash
+Unified Node: Success with google/gemini-3-flash on attempt 1
 Prompt executed in 10.19 seconds
 
 
@@ -296,6 +363,8 @@ Cost is calculated using:
 
 
 Token usage is extracted from API metrics when available.
+
+Note that each retry attempt incurs its own API cost, since retries are independent full requests rather than continuations. Truncated responses are still billed for the tokens they consumed before being cut off.
 
 ---
 
@@ -374,15 +443,13 @@ This node is designed for:
 
 It is **not intended for large-scale batch captioning**, but for fast experimentation with individual images.
 
-
 ---
 
 # Acknowledgements
 
-Parts of this project were developed with assistance from AI tools, including OpenAI ChatGPT and Google Gemini, which were used for brainstorming, debugging, and code refinement.
+Parts of this project were developed with assistance from AI tools, including OpenAI ChatGPT, Google Gemini, and Anthropic Claude, which were used for brainstorming, debugging, and code refinement.
 
 The overall design, implementation, and integration of the node were carried out by the repository author.
-
 
 ---
 
