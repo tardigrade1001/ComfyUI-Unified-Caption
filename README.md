@@ -1,6 +1,6 @@
 # ComfyUI Unified Caption Node
 
-Unified multimodal captioning node for ComfyUI with OpenRouter and Replicate support.
+Unified multimodal captioning node for ComfyUI with OpenRouter, Replicate, and Cerebras support.
 
 ---
 
@@ -26,9 +26,11 @@ The node is designed primarily for **interactive captioning workflows**, where a
 
 # Features
 
-- Unified interface for **OpenRouter and Replicate multimodal models**
+- Unified interface for **OpenRouter, Replicate, and Cerebras multimodal models**
 - Supports models such as **Gemini, Grok, and GPT vision models**
 - **Automatic truncation detection** — output is validated for sentence completeness before being accepted
+- **Thinking-budget control on Replicate Gemini** — reasoning is disabled/minimized so it doesn't eat the output budget and truncate captions
+- **Caption caching + freeze** — reuses the caption when nothing relevant changed, and a `freeze_caption` toggle hard-locks it so you can iterate downstream with zero API calls
 - **Same-model retry with exponential backoff** — transient connection drops recover automatically
 - **Cross-provider fallback** — optional retry model kicks in if the primary fails repeatedly
 - **Cost estimation per request** using token usage
@@ -59,7 +61,7 @@ Examples:
 
 google/gemini-2.5-flash
 google/gemini-3-flash-preview
-x-ai/grok-4.1-fast
+x-ai/grok-4.3
 openai/gpt-5-mini
 
 
@@ -118,7 +120,7 @@ Example entries:
 
 
 replicate/google/gemini-3-flash
-openrouter/x-ai/grok-4.1-fast
+openrouter/x-ai/grok-4.3
 
 
 Each entry also includes token pricing information used for cost estimation.
@@ -167,6 +169,18 @@ This preprocessing reduces **API cost and latency** while preserving sufficient 
 
 # Optional Inputs
 
+## Freeze Caption + Caption Caching
+
+Captioning is the slow, paid step; everything downstream of it is cheap. To avoid re-calling the API when the caption hasn't actually changed, the node caches the last result.
+
+**Automatic cache (always on).** The caption is keyed on the **caption-relevant** inputs only — image content (a thumbnail hash), `prompt`, `model`, `retry_model`, `system_instruction`, `temperature`, `max_tokens`, and `seed`. If those are unchanged, the cached text is reused with no API call. `error_fallback_value` is deliberately excluded, so changing it never re-captions. `seed` stays in the key, so bumping it still forces a fresh reroll.
+
+**`freeze_caption` (manual hard-lock).** When **on**, the node reuses the last caption **regardless** of what changed — even the image, prompt, or seed — for zero API calls until you turn it off. If no caption exists yet, it captions once to seed the freeze. Use it to iterate on downstream nodes without paying for (or waiting on) re-captions.
+
+The cache is per-node and in-session: it persists across runs while ComfyUI is open and clears on restart.
+
+---
+
 ## System Instruction
 
 Optional system-level instruction sent to the model.
@@ -205,6 +219,20 @@ OPENROUTER_API_KEY
 
 ---
 
+## Cerebras API Key
+
+API key used for Cerebras models.
+
+If left empty, the node will check the environment variable:
+
+
+CEREBRAS_API_KEY
+
+
+Cerebras is OpenAI-compatible and extremely fast (sub-2s captions), with a free tier. Only `cerebras/gemma-4-31b` is multimodal and exposed here — the other Cerebras models (`gpt-oss-120b`, `zai-glm-4.7`) are text-only and return `multimodal_not_enabled` for image input. Free-tier limits are tight (5 requests/min, ~1M tokens/day, 2 images & 4 MB per request), so it suits spot-checks and small volumes rather than large batch runs.
+
+---
+
 ## Retry Model
 
 Optional fallback model used when the primary model fails repeatedly.
@@ -217,7 +245,7 @@ Example pairing:
 
 
 Primary: replicate/google/gemini-3-flash
-Retry:   openrouter/x-ai/grok-4.1-fast
+Retry:   openrouter/x-ai/grok-4.3
 
 
 If the retry model is left the same as the primary, only the primary is attempted (3 attempts total, then fallback value).
@@ -265,7 +293,10 @@ Maximum number of tokens the model can generate.
 Default:
 
 
-1024
+2048
+
+
+> **Note (Replicate Gemini):** Gemini's reasoning ("thinking") tokens are drawn from the *same* `max_output_tokens` budget as the visible output. To stop reasoning from eating the budget and truncating captions, the node disables/minimizes thinking on the Replicate Gemini models automatically (`thinking_budget: 0` for 2.5, `thinking_level: low` for 3). OpenRouter counts output separately and is unaffected.
 
 
 ---
@@ -292,6 +323,8 @@ Frontier multimodal APIs occasionally return truncated responses due to transien
 ### How truncation detection works
 
 After each API call, the node checks whether the returned text ends in terminal punctuation (`.`, `!`, `?`, closing quotes, or closing brackets). A complete caption ends in a sentence terminator; a truncated caption typically ends mid-word or mid-phrase. If the output looks truncated, the node treats the attempt as failed and retries.
+
+The most common *cause* of truncation on Replicate — reasoning tokens consuming the output budget — is prevented upstream by the thinking-budget control described under **Max Tokens**, so truncation detection is mostly a safety net for genuine transient drops.
 
 ### Retry flow
 
@@ -329,8 +362,8 @@ Unified Node: Attempting replicate/google/gemini-3-flash (attempt 2/3)
 Unified Node: google/gemini-3-flash attempt 2 failed -> ...
 Unified Node: Attempting replicate/google/gemini-3-flash (attempt 3/3)
 Unified Node: google/gemini-3-flash attempt 3 failed -> ...
-Unified Node: Attempting openrouter/x-ai/grok-4.1-fast (attempt 1/3)
-Unified Node: Success with x-ai/grok-4.1-fast on attempt 1
+Unified Node: Attempting openrouter/x-ai/grok-4.3 (attempt 1/3)
+Unified Node: Success with x-ai/grok-4.3 on attempt 1
 
 
 ### Typical timing
@@ -338,6 +371,8 @@ Unified Node: Success with x-ai/grok-4.1-fast on attempt 1
 - Clean first-attempt success: ~5 seconds
 - One truncation recovered on retry: ~12 seconds
 - Worst case (all primary attempts fail, retry model succeeds): ~25 seconds
+
+On Replicate the request uses `Prefer: wait`, so the prediction is usually returned on the initial call without entering the poll loop; polling (up to 180s) remains as a fallback for slower runs. A cache hit or freeze returns instantly with no network call at all.
 
 ---
 
